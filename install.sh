@@ -107,6 +107,82 @@ pick_random_sni() {
     echo "${SNI_DOMAINS[$idx]}"
 }
 
+# --- BBR + 内核网络优化 ---
+
+enable_bbr() {
+    info "检测 BBR 状态..."
+
+    # 检查当前是否已启用 BBR
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$current_cc" == "bbr" ]]; then
+        info "BBR 已启用，跳过"
+    else
+        # 检查内核是否支持 BBR (4.9+)
+        local kver
+        kver=$(uname -r | cut -d. -f1-2)
+        local kmajor kminor
+        kmajor=$(echo "$kver" | cut -d. -f1)
+        kminor=$(echo "$kver" | cut -d. -f2)
+
+        if (( kmajor < 4 )) || { (( kmajor == 4 )) && (( kminor < 9 )); }; then
+            warn "内核版本 $(uname -r) 不支持 BBR (需要 4.9+)，跳过"
+            return
+        fi
+
+        info "启用 BBR..."
+        modprobe tcp_bbr 2>/dev/null || true
+
+        # 写入 sysctl 配置
+        cat > /etc/sysctl.d/99-anytls-bbr.conf <<'SYSEOF'
+# BBR 拥塞控制
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# TCP 优化
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+
+# 缓冲区优化
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 212992 16777216
+net.ipv4.tcp_wmem = 4096 212992 16777216
+net.core.netdev_max_backlog = 10000
+
+# 连接优化
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_max_tw_buckets = 5000
+net.ipv4.tcp_mtu_probing = 1
+
+# 文件描述符
+fs.file-max = 1048576
+SYSEOF
+
+        sysctl --system > /dev/null 2>&1
+
+        # 验证
+        current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        if [[ "$current_cc" == "bbr" ]]; then
+            info "BBR 启用成功"
+        else
+            warn "BBR 启用失败，当前拥塞控制: $current_cc"
+        fi
+    fi
+
+    # 显示状态
+    local qdisc cc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    info "拥塞控制: $cc | 队列调度: $qdisc"
+}
+
 generate_random_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16; }
 generate_sub_token()       { tr -dc 'a-z0-9' < /dev/urandom | head -c 32; }
 
@@ -340,6 +416,9 @@ do_install() {
     # 依赖
     install_deps
 
+    # BBR + 网络优化
+    enable_bbr
+
     # 架构 & 版本
     local arch version
     arch=$(get_arch)
@@ -435,6 +514,8 @@ do_uninstall() {
 
     rm -f "${INSTALL_DIR}/anytls-server" "${INSTALL_DIR}/anytls-client" "${INSTALL_DIR}/${SCRIPT_NAME}"
     rm -rf "$CONFIG_DIR"
+    rm -f /etc/sysctl.d/99-anytls-bbr.conf
+    sysctl --system > /dev/null 2>&1 || true
 
     info "卸载完成"
 }
@@ -476,6 +557,7 @@ show_connection_info() {
     echo "  订阅端口   : $sub_port"
     echo "  协议       : AnyTLS"
     echo "  允许不安全 : 已自动开启 (insecure=1)"
+    echo "  BBR        : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
     echo "-----------------------------------------------"
 }
 
@@ -508,6 +590,7 @@ display_manage_commands() {
     echo "       ${SCRIPT_NAME} status     状态"
     echo "       ${SCRIPT_NAME} log        日志 (可加 -n 50)"
     echo "       ${SCRIPT_NAME} info       显示订阅链接"
+    echo "       ${SCRIPT_NAME} bbr        启用 BBR 加速"
     echo "       ${SCRIPT_NAME} help       帮助"
     echo "-----------------------------------------------"
 }
@@ -526,6 +609,7 @@ show_help() {
     printf "  %-12s %s\n" "status"    "查看服务状态"
     printf "  %-12s %s\n" "log"       "查看日志 (如: ${SCRIPT_NAME} log -n 100)"
     printf "  %-12s %s\n" "info"      "显示订阅链接和配置信息"
+    printf "  %-12s %s\n" "bbr"       "启用 BBR 拥塞控制 + 内核网络优化 (需要 sudo)"
     printf "  %-12s %s\n" "help"      "显示帮助"
     echo ""
 }
@@ -545,6 +629,7 @@ main() {
         status)                 do_status ;;
         log)                    do_log "$@" ;;
         info)                   do_info ;;
+        bbr)                    require_root "bbr"; enable_bbr ;;
         help|-h|--help|"")      show_help ;;
         *) error "未知命令: $action (运行 ${SCRIPT_NAME} help 查看帮助)" ;;
     esac
