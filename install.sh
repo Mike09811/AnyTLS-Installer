@@ -2,10 +2,9 @@
 set -uo pipefail
 
 # ============================================================
-# AnyTLS-Go 一键安装管理脚本 (优化版)
-# 基于 https://github.com/tianrking/AnyTLS-Go-Script 优化
+# AnyTLS-Go 一键安装管理脚本
 # 支持: Ubuntu / Debian / CentOS / RHEL / Fedora
-# 特性: 自动获取最新版本 / 随机密码 / 订阅链接 / 二维码
+# 特性: 自动获取最新版本 / 随机密码 / 订阅链接 / 二维码 / BBR
 # ============================================================
 
 GITHUB_REPO="anytls/anytls-go"
@@ -22,16 +21,24 @@ SCRIPT_NAME="anytls"
 
 # SNI 伪装域名列表
 SNI_DOMAINS=(
-    "www.microsoft.com"
+    "go.microsoft.com"
+    "snap.licdn.com"
+    "devblogs.microsoft.com"
+    "cdn.bizibly.com"
     "www.apple.com"
-    "www.amazon.com"
-    "www.cloudflare.com"
-    "www.mozilla.org"
-    "www.github.com"
-    "www.bing.com"
-    "www.office.com"
-    "www.xbox.com"
-    "www.linkedin.com"
+    "ts1.tc.mm.bing.net"
+    "fpinit.itunes.apple.com"
+    "catalog.gamepass.com"
+    "gray-config-prod.api.arc-cdn.net"
+    "apps.mzstatic.com"
+    "tag.demandbase.com"
+    "r.bing.com"
+    "tag-logger.demandbase.com"
+    "cdn-dynmedia-1.microsoft.com"
+    "services.digitaleast.mobi"
+    "gray.video-player.arcpublishing.com"
+    "azure.microsoft.com"
+    "beacon.gtv-pub.com"
 )
 
 RED='\033[0;31m'
