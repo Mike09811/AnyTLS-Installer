@@ -5,15 +5,20 @@ set -uo pipefail
 # AnyTLS-Go 一键安装管理脚本 (优化版)
 # 基于 https://github.com/tianrking/AnyTLS-Go-Script 优化
 # 支持: Ubuntu / Debian / CentOS / RHEL / Fedora
+# 特性: 自动获取最新版本 / 随机密码 / 订阅链接
 # ============================================================
 
 GITHUB_REPO="anytls/anytls-go"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="anytls-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SUB_SERVICE_NAME="anytls-sub"
+SUB_SERVICE_FILE="/etc/systemd/system/${SUB_SERVICE_NAME}.service"
+CONFIG_DIR="/etc/anytls"
+CONFIG_FILE="${CONFIG_DIR}/config"
+SUB_SCRIPT="${CONFIG_DIR}/sub_server.py"
 SCRIPT_NAME="anytls"
 
-# --- 颜色 ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -43,9 +48,9 @@ get_arch() {
 
 install_deps() {
     local deps=()
-    check_command curl    || deps+=("curl")
-    check_command unzip   || deps+=("unzip")
-    check_command qrencode || deps+=("qrencode")
+    check_command curl   || deps+=("curl")
+    check_command unzip  || deps+=("unzip")
+    check_command python3 || deps+=("python3")
 
     [[ ${#deps[@]} -eq 0 ]] && return 0
 
@@ -71,26 +76,17 @@ get_latest_version() {
 
 get_public_ip() {
     local ip=""
-    local sources=(
-        "https://api.ipify.org"
-        "https://ipinfo.io/ip"
-        "https://checkip.amazonaws.com"
-        "https://icanhazip.com"
-    )
-    for src in "${sources[@]}"; do
+    for src in "https://api.ipify.org" "https://ipinfo.io/ip" "https://checkip.amazonaws.com" "https://icanhazip.com"; do
         ip=$(curl -s --max-time 5 --ipv4 "$src" 2>/dev/null | tr -d '[:space:]')
         if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "$ip"
-            return 0
+            echo "$ip"; return 0
         fi
     done
-    echo ""
-    return 1
+    echo ""; return 1
 }
 
-generate_random_password() {
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16
-}
+generate_random_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16; }
+generate_sub_token()       { tr -dc 'a-z0-9' < /dev/urandom | head -c 32; }
 
 urlencode() {
     local string="$1" strlen=${#1} encoded="" pos c o
@@ -103,6 +99,169 @@ urlencode() {
         encoded+="$o"
     done
     echo "$encoded"
+}
+
+# --- 订阅服务 ---
+
+create_sub_server() {
+    local ip="$1" port="$2" password="$3" sub_port="$4" sub_token="$5"
+
+    mkdir -p "$CONFIG_DIR"
+
+    # 保存配置
+    cat > "$CONFIG_FILE" <<EOF
+SERVER_IP=${ip}
+SERVER_PORT=${port}
+PASSWORD=${password}
+SUB_PORT=${sub_port}
+SUB_TOKEN=${sub_token}
+EOF
+    chmod 600 "$CONFIG_FILE"
+
+    # 生成 Python 订阅服务器
+    local encoded_pw
+    encoded_pw=$(urlencode "$password")
+
+    cat > "$SUB_SCRIPT" << 'PYEOF'
+#!/usr/bin/env python3
+import http.server
+import base64
+import json
+import os
+import sys
+import urllib.parse
+
+CONFIG_FILE = "/etc/anytls/config"
+
+def load_config():
+    cfg = {}
+    with open(CONFIG_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k] = v
+    return cfg
+
+def url_encode(s):
+    return urllib.parse.quote(s, safe='')
+
+class SubHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # silent
+
+    def do_GET(self):
+        cfg = load_config()
+        token = cfg.get("SUB_TOKEN", "")
+        ip = cfg.get("SERVER_IP", "")
+        port = cfg.get("SERVER_PORT", "")
+        password = cfg.get("PASSWORD", "")
+        encoded_pw = url_encode(password)
+        node_name = url_encode(f"AnyTLS-{port}")
+
+        # 验证 token
+        expected_paths = [
+            f"/sub/{token}",
+            f"/sub/{token}/",
+        ]
+        if self.path.split("?")[0] not in expected_paths:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+            return
+
+        # 获取 client 参数判断返回格式
+        query = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(query)
+        client_type = params.get("client", [""])[0].lower()
+
+        # anytls URI (通用格式)
+        anytls_uri = f"anytls://{encoded_pw}@{ip}:{port}?insecure=1#{node_name}"
+
+        if client_type == "clash" or client_type == "mihomo":
+            content = self._clash_config(ip, port, password)
+            content_type = "text/yaml; charset=utf-8"
+        elif client_type == "singbox" or client_type == "sing-box":
+            content = self._singbox_config(ip, port, password)
+            content_type = "application/json; charset=utf-8"
+        else:
+            # 默认: base64 编码的 URI (兼容 Shadowrocket / NekoBox / 通用)
+            content = base64.b64encode(anytls_uri.encode()).decode()
+            content_type = "text/plain; charset=utf-8"
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f"attachment; filename=anytls_{port}")
+        self.send_header("Subscription-Userinfo", "upload=0; download=0; total=0; expire=0")
+        self.end_headers()
+        self.wfile.write(content.encode())
+
+    def _clash_config(self, ip, port, password):
+        return f"""proxies:
+  - name: AnyTLS-{port}
+    type: anytls
+    server: {ip}
+    port: {port}
+    password: "{password}"
+    skip-cert-verify: true
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+      - AnyTLS-{port}
+
+rules:
+  - MATCH,Proxy
+"""
+
+    def _singbox_config(self, ip, port, password):
+        config = {
+            "outbounds": [
+                {
+                    "type": "anytls",
+                    "tag": f"AnyTLS-{port}",
+                    "server": ip,
+                    "server_port": int(port),
+                    "password": password,
+                    "tls": {
+                        "enabled": True,
+                        "insecure": True
+                    }
+                }
+            ]
+        }
+        return json.dumps(config, indent=2, ensure_ascii=False)
+
+if __name__ == "__main__":
+    cfg = load_config()
+    sub_port = int(cfg.get("SUB_PORT", 8444))
+    server = http.server.HTTPServer(("0.0.0.0", sub_port), SubHandler)
+    print(f"Subscription server running on port {sub_port}")
+    server.serve_forever()
+PYEOF
+
+    chmod 755 "$SUB_SCRIPT"
+
+    # systemd 服务
+    cat > "$SUB_SERVICE_FILE" <<EOF
+[Unit]
+Description=AnyTLS Subscription Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$(which python3) ${SUB_SCRIPT}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "$SUB_SERVICE_NAME" > /dev/null 2>&1
+    systemctl restart "$SUB_SERVICE_NAME"
 }
 
 # --- 安装 ---
@@ -121,6 +280,14 @@ do_install() {
     local port="${input_port:-8443}"
     if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
         error "端口号无效: $port"
+    fi
+
+    # 订阅端口
+    local default_sub_port=$((port + 1))
+    read -rp "请输入订阅服务端口 (默认 ${default_sub_port}): " input_sub_port
+    local sub_port="${input_sub_port:-$default_sub_port}"
+    if ! [[ "$sub_port" =~ ^[0-9]+$ ]] || (( sub_port < 1 || sub_port > 65535 )); then
+        error "订阅端口号无效: $sub_port"
     fi
 
     # 密码
@@ -157,9 +324,8 @@ do_install() {
     unzip -o "${tmp_dir}/${filename}" -d "${tmp_dir}" > /dev/null || error "解压失败"
 
     # 停止旧服务
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        systemctl stop "$SERVICE_NAME"
-    fi
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    systemctl stop "$SUB_SERVICE_NAME" 2>/dev/null || true
 
     # 安装二进制
     for bin in anytls-server anytls-client; do
@@ -200,15 +366,18 @@ EOF
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
     systemctl restart "$SERVICE_NAME"
 
+    # 订阅服务
+    local server_ip sub_token
+    server_ip=$(get_public_ip) || server_ip="YOUR_SERVER_IP"
+    sub_token=$(generate_sub_token)
+    create_sub_server "$server_ip" "$port" "$password" "$sub_port" "$sub_token"
+
     sleep 2
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         echo ""
-        info "AnyTLS 服务安装成功并已启动"
+        info "AnyTLS 安装成功并已启动"
         echo ""
-        local server_ip
-        server_ip=$(get_public_ip) || server_ip="YOUR_SERVER_IP"
-        show_connection_info "$server_ip" "$port" "$password"
-        generate_qr_codes "$server_ip" "$port" "$password"
+        show_connection_info "$server_ip" "$port" "$password" "$sub_port" "$sub_token"
         echo ""
         display_manage_commands
     else
@@ -224,88 +393,70 @@ do_uninstall() {
 
     systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-    rm -f "$SERVICE_FILE"
+    systemctl stop "$SUB_SERVICE_NAME" 2>/dev/null || true
+    systemctl disable "$SUB_SERVICE_NAME" 2>/dev/null || true
+    rm -f "$SERVICE_FILE" "$SUB_SERVICE_FILE"
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null || true
 
     rm -f "${INSTALL_DIR}/anytls-server" "${INSTALL_DIR}/anytls-client" "${INSTALL_DIR}/${SCRIPT_NAME}"
+    rm -rf "$CONFIG_DIR"
 
     info "卸载完成"
 }
 
 # --- 服务管理 ---
 
-do_start()   { require_root "start";   systemctl start   "$SERVICE_NAME"; sleep 1; do_status; }
-do_stop()    { require_root "stop";    systemctl stop    "$SERVICE_NAME"; sleep 1; do_status; }
-do_restart() { require_root "restart"; systemctl restart "$SERVICE_NAME"; sleep 1; do_status; }
-do_status()  { systemctl status "$SERVICE_NAME" --no-pager; }
+do_start()   { require_root "start";   systemctl start "$SERVICE_NAME"; systemctl start "$SUB_SERVICE_NAME"; sleep 1; do_status; }
+do_stop()    { require_root "stop";    systemctl stop "$SERVICE_NAME"; systemctl stop "$SUB_SERVICE_NAME"; sleep 1; do_status; }
+do_restart() { require_root "restart"; systemctl restart "$SERVICE_NAME"; systemctl restart "$SUB_SERVICE_NAME"; sleep 1; do_status; }
+do_status()  { systemctl status "$SERVICE_NAME" --no-pager; echo ""; systemctl status "$SUB_SERVICE_NAME" --no-pager; }
 do_log()     { journalctl -u "$SERVICE_NAME" -f "$@"; }
 
 # --- 信息展示 ---
 
 show_connection_info() {
-    local ip="$1" port="$2" password="$3"
-    echo "-----------------------------------------------"
+    local ip="$1" port="$2" password="$3" sub_port="$4" sub_token="$5"
+    local encoded_pw
+    encoded_pw=$(urlencode "$password")
+    local sub_url="http://${ip}:${sub_port}/sub/${sub_token}"
+
+    echo "==========================================="
+    hint "  【订阅链接 - 通用】(Shadowrocket / NekoBox / 通用客户端)"
+    echo "  ${sub_url}"
+    echo ""
+    hint "  【订阅链接 - Clash / Mihomo】"
+    echo "  ${sub_url}?client=clash"
+    echo ""
+    hint "  【订阅链接 - sing-box】"
+    echo "  ${sub_url}?client=singbox"
+    echo "==========================================="
+    echo ""
     echo "  服务器地址 : $ip"
     echo "  服务器端口 : $port"
     echo "  密码       : $password"
+    echo "  订阅端口   : $sub_port"
     echo "  协议       : AnyTLS"
-    echo "  注意       : 使用自签名证书，客户端需开启「允许不安全」"
+    echo "  注意       : 客户端需开启「允许不安全 / 跳过证书验证」"
     echo "-----------------------------------------------"
 }
 
-generate_qr_codes() {
-    local ip="$1" port="$2" password="$3"
-
-    if ! check_command qrencode; then
-        warn "未安装 qrencode，跳过二维码生成"
-        return
+do_info() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error "未找到配置，请先运行: sudo ${SCRIPT_NAME} install"
     fi
 
-    local encoded_pw remarks
-    encoded_pw=$(urlencode "$password")
-    remarks=$(urlencode "AnyTLS-${port}")
+    source "$CONFIG_FILE"
+    local ip="${SERVER_IP:-}"
+    local port="${SERVER_PORT:-}"
+    local password="${PASSWORD:-}"
+    local sub_port="${SUB_PORT:-}"
+    local sub_token="${SUB_TOKEN:-}"
 
-    # NekoBox
-    local neko_uri="anytls://${encoded_pw}@${ip}:${port}?allowInsecure=true#${remarks}"
+    [[ -z "$ip" ]] && ip=$(get_public_ip) || true
+
     echo ""
-    hint "【NekoBox 链接】"
-    echo "$neko_uri"
-    qrencode -t ANSIUTF8 -m 1 "$neko_uri"
-
-    # Shadowrocket
-    local sr_uri="anytls://${encoded_pw}@${ip}:${port}#${remarks}"
-    echo ""
-    hint "【Shadowrocket 链接】"
-    echo "$sr_uri"
-    qrencode -t ANSIUTF8 -m 1 "$sr_uri"
-    echo "提醒: Shadowrocket 扫码后请手动开启「允许不安全」"
-    echo "-----------------------------------------------"
-}
-
-do_qr() {
-    [[ ! -f "$SERVICE_FILE" ]] && error "AnyTLS 尚未安装，请先运行: sudo ${SCRIPT_NAME} install"
-
-    install_deps
-
-    local port
-    port=$(grep -Po 'ExecStart=.*-l 0\.0\.0\.0:\K[0-9]+' "$SERVICE_FILE" 2>/dev/null)
-    if [[ -z "$port" ]]; then
-        read -rp "请输入当前配置的端口: " port
-        [[ ! "$port" =~ ^[0-9]+$ ]] && error "端口号无效"
-    else
-        info "读取到端口: $port"
-    fi
-
-    local password
-    read -rs -p "请输入密码: " password; echo
-    [[ -z "$password" ]] && error "密码不能为空"
-
-    local ip
-    ip=$(get_public_ip) || ip="YOUR_SERVER_IP"
-
-    show_connection_info "$ip" "$port" "$password"
-    generate_qr_codes "$ip" "$port" "$password"
+    show_connection_info "$ip" "$port" "$password" "$sub_port" "$sub_token"
 }
 
 display_manage_commands() {
@@ -317,7 +468,7 @@ display_manage_commands() {
     echo "  sudo ${SCRIPT_NAME} restart    重启"
     echo "       ${SCRIPT_NAME} status     状态"
     echo "       ${SCRIPT_NAME} log        日志 (可加 -n 50)"
-    echo "       ${SCRIPT_NAME} qr         显示二维码"
+    echo "       ${SCRIPT_NAME} info       显示订阅链接"
     echo "       ${SCRIPT_NAME} help       帮助"
     echo "-----------------------------------------------"
 }
@@ -335,7 +486,7 @@ show_help() {
     printf "  %-12s %s\n" "restart"   "重启服务 (需要 sudo)"
     printf "  %-12s %s\n" "status"    "查看服务状态"
     printf "  %-12s %s\n" "log"       "查看日志 (如: ${SCRIPT_NAME} log -n 100)"
-    printf "  %-12s %s\n" "qr"        "重新生成二维码"
+    printf "  %-12s %s\n" "info"      "显示订阅链接和配置信息"
     printf "  %-12s %s\n" "help"      "显示帮助"
     echo ""
 }
@@ -354,7 +505,7 @@ main() {
         restart)                do_restart ;;
         status)                 do_status ;;
         log)                    do_log "$@" ;;
-        qr)                     do_qr ;;
+        info)                   do_info ;;
         help|-h|--help|"")      show_help ;;
         *) error "未知命令: $action (运行 ${SCRIPT_NAME} help 查看帮助)" ;;
     esac
