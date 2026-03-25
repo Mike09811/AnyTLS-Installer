@@ -11,6 +11,7 @@ GITHUB_REPO="anytls/anytls-go"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="anytls-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SCRIPT_NAME="anytls"
 
 # --- 颜色 ---
 RED='\033[0;31m'
@@ -29,7 +30,7 @@ hint()  { echo -e "${CYAN}$*${NC}"; }
 check_command() { command -v "$1" >/dev/null 2>&1; }
 
 require_root() {
-    [[ $(id -u) -ne 0 ]] && error "此操作需要 root 权限，请使用 sudo $0 $1"
+    [[ $(id -u) -ne 0 ]] && error "此操作需要 root 权限，请使用 sudo ${SCRIPT_NAME} $1"
 }
 
 get_arch() {
@@ -87,6 +88,10 @@ get_public_ip() {
     return 1
 }
 
+generate_random_password() {
+    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16
+}
+
 urlencode() {
     local string="$1" strlen=${#1} encoded="" pos c o
     for (( pos=0; pos<strlen; pos++ )); do
@@ -119,14 +124,12 @@ do_install() {
     fi
 
     # 密码
-    local password password_confirm
-    while true; do
-        read -rs -p "请输入密码 (必填): " password; echo
-        [[ -z "$password" ]] && { warn "密码不能为空"; continue; }
-        read -rs -p "请再次确认密码: " password_confirm; echo
-        [[ "$password" == "$password_confirm" ]] && break
-        warn "两次密码不一致，请重新输入"
-    done
+    local password
+    read -rs -p "请输入密码 (直接回车随机生成): " password; echo
+    if [[ -z "$password" ]]; then
+        password=$(generate_random_password)
+        info "已生成随机密码: $password"
+    fi
 
     # 依赖
     install_deps
@@ -165,6 +168,14 @@ do_install() {
             info "已安装 ${INSTALL_DIR}/${bin}"
         fi
     done
+
+    # 安装管理脚本自身
+    local self_script
+    self_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "")
+    if [[ -n "$self_script" && -f "$self_script" ]]; then
+        install -m 755 "$self_script" "${INSTALL_DIR}/${SCRIPT_NAME}"
+        info "管理脚本已安装到 ${INSTALL_DIR}/${SCRIPT_NAME}"
+    fi
 
     # systemd 服务
     cat > "$SERVICE_FILE" <<EOF
@@ -217,7 +228,7 @@ do_uninstall() {
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null || true
 
-    rm -f "${INSTALL_DIR}/anytls-server" "${INSTALL_DIR}/anytls-client"
+    rm -f "${INSTALL_DIR}/anytls-server" "${INSTALL_DIR}/anytls-client" "${INSTALL_DIR}/${SCRIPT_NAME}"
 
     info "卸载完成"
 }
@@ -273,7 +284,7 @@ generate_qr_codes() {
 }
 
 do_qr() {
-    [[ ! -f "$SERVICE_FILE" ]] && error "AnyTLS 尚未安装，请先运行: sudo $0 install"
+    [[ ! -f "$SERVICE_FILE" ]] && error "AnyTLS 尚未安装，请先运行: sudo ${SCRIPT_NAME} install"
 
     install_deps
 
@@ -299,15 +310,15 @@ do_qr() {
 
 display_manage_commands() {
     echo "【管理命令】"
-    echo "  sudo $0 install    安装/更新"
-    echo "  sudo $0 uninstall  卸载"
-    echo "  sudo $0 start      启动"
-    echo "  sudo $0 stop       停止"
-    echo "  sudo $0 restart    重启"
-    echo "       $0 status     状态"
-    echo "       $0 log        日志 (可加 -n 50)"
-    echo "       $0 qr         显示二维码"
-    echo "       $0 help       帮助"
+    echo "  sudo ${SCRIPT_NAME} install    安装/更新"
+    echo "  sudo ${SCRIPT_NAME} uninstall  卸载"
+    echo "  sudo ${SCRIPT_NAME} start      启动"
+    echo "  sudo ${SCRIPT_NAME} stop       停止"
+    echo "  sudo ${SCRIPT_NAME} restart    重启"
+    echo "       ${SCRIPT_NAME} status     状态"
+    echo "       ${SCRIPT_NAME} log        日志 (可加 -n 50)"
+    echo "       ${SCRIPT_NAME} qr         显示二维码"
+    echo "       ${SCRIPT_NAME} help       帮助"
     echo "-----------------------------------------------"
 }
 
@@ -315,7 +326,7 @@ show_help() {
     echo ""
     echo "AnyTLS-Go 一键管理脚本 (优化版)"
     echo ""
-    echo "用法: $0 <命令>"
+    echo "用法: ${SCRIPT_NAME} <命令>"
     echo ""
     printf "  %-12s %s\n" "install"   "安装或更新 AnyTLS-Go (需要 sudo)"
     printf "  %-12s %s\n" "uninstall" "卸载 AnyTLS-Go (需要 sudo)"
@@ -323,7 +334,7 @@ show_help() {
     printf "  %-12s %s\n" "stop"      "停止服务 (需要 sudo)"
     printf "  %-12s %s\n" "restart"   "重启服务 (需要 sudo)"
     printf "  %-12s %s\n" "status"    "查看服务状态"
-    printf "  %-12s %s\n" "log"       "查看日志 (如: $0 log -n 100)"
+    printf "  %-12s %s\n" "log"       "查看日志 (如: ${SCRIPT_NAME} log -n 100)"
     printf "  %-12s %s\n" "qr"        "重新生成二维码"
     printf "  %-12s %s\n" "help"      "显示帮助"
     echo ""
@@ -345,7 +356,7 @@ main() {
         log)                    do_log "$@" ;;
         qr)                     do_qr ;;
         help|-h|--help|"")      show_help ;;
-        *) error "未知命令: $action (运行 $0 help 查看帮助)" ;;
+        *) error "未知命令: $action (运行 ${SCRIPT_NAME} help 查看帮助)" ;;
     esac
 }
 
