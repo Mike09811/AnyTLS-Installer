@@ -1,4 +1,4 @@
-# AnyTLS-Go Installer
+# AnyTLS Installer|AnyTLS 一键安装脚本
 
 [AnyTLS-Go](https://github.com/anytls/anytls-go) 一键安装管理脚本，支持 Ubuntu / Debian / CentOS / RHEL / Fedora。
 
