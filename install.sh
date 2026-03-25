@@ -5,10 +5,11 @@ set -uo pipefail
 # AnyTLS-Go 一键安装管理脚本 (优化版)
 # 基于 https://github.com/tianrking/AnyTLS-Go-Script 优化
 # 支持: Ubuntu / Debian / CentOS / RHEL / Fedora
-# 特性: 自动获取最新版本 / 随机密码 / 订阅链接
+# 特性: 自动获取最新版本 / 随机密码 / 订阅链接 / 二维码
 # ============================================================
 
 GITHUB_REPO="anytls/anytls-go"
+SCRIPT_REPO="https://raw.githubusercontent.com/Mike09811/AnyTLS-Installer/main/install.sh"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="anytls-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -18,6 +19,20 @@ CONFIG_DIR="/etc/anytls"
 CONFIG_FILE="${CONFIG_DIR}/config"
 SUB_SCRIPT="${CONFIG_DIR}/sub_server.py"
 SCRIPT_NAME="anytls"
+
+# SNI 伪装域名列表
+SNI_DOMAINS=(
+    "www.microsoft.com"
+    "www.apple.com"
+    "www.amazon.com"
+    "www.cloudflare.com"
+    "www.mozilla.org"
+    "www.github.com"
+    "www.bing.com"
+    "www.office.com"
+    "www.xbox.com"
+    "www.linkedin.com"
+)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,9 +63,10 @@ get_arch() {
 
 install_deps() {
     local deps=()
-    check_command curl   || deps+=("curl")
-    check_command unzip  || deps+=("unzip")
-    check_command python3 || deps+=("python3")
+    check_command curl     || deps+=("curl")
+    check_command unzip    || deps+=("unzip")
+    check_command python3  || deps+=("python3")
+    check_command qrencode || deps+=("qrencode")
 
     [[ ${#deps[@]} -eq 0 ]] && return 0
 
@@ -85,6 +101,12 @@ get_public_ip() {
     echo ""; return 1
 }
 
+pick_random_sni() {
+    local count=${#SNI_DOMAINS[@]}
+    local idx=$((RANDOM % count))
+    echo "${SNI_DOMAINS[$idx]}"
+}
+
 generate_random_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16; }
 generate_sub_token()       { tr -dc 'a-z0-9' < /dev/urandom | head -c 32; }
 
@@ -101,34 +123,52 @@ urlencode() {
     echo "$encoded"
 }
 
+show_qr() {
+    local text="$1"
+    if check_command qrencode; then
+        qrencode -t ANSIUTF8 -m 1 "$text"
+    fi
+}
+
+install_management_script() {
+    info "安装管理脚本到 ${INSTALL_DIR}/${SCRIPT_NAME} ..."
+    curl -fsSL -o "${INSTALL_DIR}/${SCRIPT_NAME}" "$SCRIPT_REPO" || {
+        # fallback: 尝试从本地复制
+        local self_script
+        self_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "")
+        if [[ -n "$self_script" && -f "$self_script" ]]; then
+            cp "$self_script" "${INSTALL_DIR}/${SCRIPT_NAME}"
+        else
+            warn "无法安装管理脚本，请手动下载"
+            return 1
+        fi
+    }
+    chmod 755 "${INSTALL_DIR}/${SCRIPT_NAME}"
+    info "管理脚本已安装，可直接使用 ${SCRIPT_NAME} 命令"
+}
+
 # --- 订阅服务 ---
 
 create_sub_server() {
-    local ip="$1" port="$2" password="$3" sub_port="$4" sub_token="$5"
+    local ip="$1" port="$2" password="$3" sub_port="$4" sub_token="$5" sni="$6"
 
     mkdir -p "$CONFIG_DIR"
 
-    # 保存配置
     cat > "$CONFIG_FILE" <<EOF
 SERVER_IP=${ip}
 SERVER_PORT=${port}
 PASSWORD=${password}
 SUB_PORT=${sub_port}
 SUB_TOKEN=${sub_token}
+SNI=${sni}
 EOF
     chmod 600 "$CONFIG_FILE"
-
-    # 生成 Python 订阅服务器
-    local encoded_pw
-    encoded_pw=$(urlencode "$password")
 
     cat > "$SUB_SCRIPT" << 'PYEOF'
 #!/usr/bin/env python3
 import http.server
 import base64
 import json
-import os
-import sys
 import urllib.parse
 
 CONFIG_FILE = "/etc/anytls/config"
@@ -148,7 +188,7 @@ def url_encode(s):
 
 class SubHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # silent
+        pass
 
     def do_GET(self):
         cfg = load_config()
@@ -156,53 +196,48 @@ class SubHandler(http.server.BaseHTTPRequestHandler):
         ip = cfg.get("SERVER_IP", "")
         port = cfg.get("SERVER_PORT", "")
         password = cfg.get("PASSWORD", "")
+        sni = cfg.get("SNI", "www.microsoft.com")
         encoded_pw = url_encode(password)
         node_name = url_encode(f"AnyTLS-{port}")
 
-        # 验证 token
-        expected_paths = [
-            f"/sub/{token}",
-            f"/sub/{token}/",
-        ]
-        if self.path.split("?")[0] not in expected_paths:
+        path_clean = self.path.split("?")[0].rstrip("/")
+        if path_clean != f"/sub/{token}":
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
             return
 
-        # 获取 client 参数判断返回格式
         query = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(query)
         client_type = params.get("client", [""])[0].lower()
 
-        # anytls URI (通用格式)
-        anytls_uri = f"anytls://{encoded_pw}@{ip}:{port}?insecure=1#{node_name}"
+        anytls_uri = f"anytls://{encoded_pw}@{ip}:{port}?sni={url_encode(sni)}&insecure=1#{node_name}"
 
-        if client_type == "clash" or client_type == "mihomo":
-            content = self._clash_config(ip, port, password)
-            content_type = "text/yaml; charset=utf-8"
-        elif client_type == "singbox" or client_type == "sing-box":
-            content = self._singbox_config(ip, port, password)
-            content_type = "application/json; charset=utf-8"
+        if client_type in ("clash", "mihomo"):
+            content = self._clash_config(ip, port, password, sni)
+            ctype = "text/yaml; charset=utf-8"
+        elif client_type in ("singbox", "sing-box"):
+            content = self._singbox_config(ip, port, password, sni)
+            ctype = "application/json; charset=utf-8"
         else:
-            # 默认: base64 编码的 URI (兼容 Shadowrocket / NekoBox / 通用)
             content = base64.b64encode(anytls_uri.encode()).decode()
-            content_type = "text/plain; charset=utf-8"
+            ctype = "text/plain; charset=utf-8"
 
         self.send_response(200)
-        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Disposition", f"attachment; filename=anytls_{port}")
         self.send_header("Subscription-Userinfo", "upload=0; download=0; total=0; expire=0")
         self.end_headers()
         self.wfile.write(content.encode())
 
-    def _clash_config(self, ip, port, password):
+    def _clash_config(self, ip, port, password, sni):
         return f"""proxies:
   - name: AnyTLS-{port}
     type: anytls
     server: {ip}
     port: {port}
     password: "{password}"
+    sni: {sni}
     skip-cert-verify: true
 
 proxy-groups:
@@ -215,21 +250,20 @@ rules:
   - MATCH,Proxy
 """
 
-    def _singbox_config(self, ip, port, password):
+    def _singbox_config(self, ip, port, password, sni):
         config = {
-            "outbounds": [
-                {
-                    "type": "anytls",
-                    "tag": f"AnyTLS-{port}",
-                    "server": ip,
-                    "server_port": int(port),
-                    "password": password,
-                    "tls": {
-                        "enabled": True,
-                        "insecure": True
-                    }
+            "outbounds": [{
+                "type": "anytls",
+                "tag": f"AnyTLS-{port}",
+                "server": ip,
+                "server_port": int(port),
+                "password": password,
+                "tls": {
+                    "enabled": True,
+                    "insecure": True,
+                    "server_name": sni
                 }
-            ]
+            }]
         }
         return json.dumps(config, indent=2, ensure_ascii=False)
 
@@ -243,7 +277,6 @@ PYEOF
 
     chmod 755 "$SUB_SCRIPT"
 
-    # systemd 服务
     cat > "$SUB_SERVICE_FILE" <<EOF
 [Unit]
 Description=AnyTLS Subscription Server
@@ -298,6 +331,12 @@ do_install() {
         info "已生成随机密码: $password"
     fi
 
+    # SNI
+    local sni
+    sni=$(pick_random_sni)
+    read -rp "请输入 SNI 伪装域名 (默认 ${sni}): " input_sni
+    sni="${input_sni:-$sni}"
+
     # 依赖
     install_deps
 
@@ -335,13 +374,8 @@ do_install() {
         fi
     done
 
-    # 安装管理脚本自身
-    local self_script
-    self_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "")
-    if [[ -n "$self_script" && -f "$self_script" ]]; then
-        install -m 755 "$self_script" "${INSTALL_DIR}/${SCRIPT_NAME}"
-        info "管理脚本已安装到 ${INSTALL_DIR}/${SCRIPT_NAME}"
-    fi
+    # 安装管理脚本
+    install_management_script
 
     # systemd 服务
     cat > "$SERVICE_FILE" <<EOF
@@ -370,14 +404,14 @@ EOF
     local server_ip sub_token
     server_ip=$(get_public_ip) || server_ip="YOUR_SERVER_IP"
     sub_token=$(generate_sub_token)
-    create_sub_server "$server_ip" "$port" "$password" "$sub_port" "$sub_token"
+    create_sub_server "$server_ip" "$port" "$password" "$sub_port" "$sub_token" "$sni"
 
     sleep 2
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         echo ""
         info "AnyTLS 安装成功并已启动"
         echo ""
-        show_connection_info "$server_ip" "$port" "$password" "$sub_port" "$sub_token"
+        show_connection_info "$server_ip" "$port" "$password" "$sub_port" "$sub_token" "$sni"
         echo ""
         display_manage_commands
     else
@@ -416,28 +450,32 @@ do_log()     { journalctl -u "$SERVICE_NAME" -f "$@"; }
 # --- 信息展示 ---
 
 show_connection_info() {
-    local ip="$1" port="$2" password="$3" sub_port="$4" sub_token="$5"
-    local encoded_pw
-    encoded_pw=$(urlencode "$password")
+    local ip="$1" port="$2" password="$3" sub_port="$4" sub_token="$5" sni="$6"
     local sub_url="http://${ip}:${sub_port}/sub/${sub_token}"
 
     echo "==========================================="
+    echo ""
     hint "  【订阅链接 - 通用】(Shadowrocket / NekoBox / 通用客户端)"
     echo "  ${sub_url}"
+    show_qr "$sub_url"
     echo ""
     hint "  【订阅链接 - Clash / Mihomo】"
     echo "  ${sub_url}?client=clash"
+    show_qr "${sub_url}?client=clash"
     echo ""
     hint "  【订阅链接 - sing-box】"
     echo "  ${sub_url}?client=singbox"
+    show_qr "${sub_url}?client=singbox"
+    echo ""
     echo "==========================================="
     echo ""
     echo "  服务器地址 : $ip"
     echo "  服务器端口 : $port"
     echo "  密码       : $password"
+    echo "  SNI        : $sni"
     echo "  订阅端口   : $sub_port"
     echo "  协议       : AnyTLS"
-    echo "  注意       : 客户端需开启「允许不安全 / 跳过证书验证」"
+    echo "  允许不安全 : 已自动开启 (insecure=1)"
     echo "-----------------------------------------------"
 }
 
@@ -452,11 +490,12 @@ do_info() {
     local password="${PASSWORD:-}"
     local sub_port="${SUB_PORT:-}"
     local sub_token="${SUB_TOKEN:-}"
+    local sni="${SNI:-www.microsoft.com}"
 
     [[ -z "$ip" ]] && ip=$(get_public_ip) || true
 
     echo ""
-    show_connection_info "$ip" "$port" "$password" "$sub_port" "$sub_token"
+    show_connection_info "$ip" "$port" "$password" "$sub_port" "$sub_token" "$sni"
 }
 
 display_manage_commands() {
